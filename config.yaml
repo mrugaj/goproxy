@@ -1,0 +1,9 @@
+port: 8000
+
+health_check_interval: 5s
+
+max_retries: 3
+
+backends:
+  - "http://localhost:8080"
+  - "http://localhost:8081"

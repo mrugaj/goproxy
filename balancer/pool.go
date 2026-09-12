@@ -2,7 +2,9 @@ package balancer
 
 import (
 	"context"
+	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"time"
@@ -31,27 +33,35 @@ func NewServerPool(backendURLs []string) (*ServerPool, error) {
 	}, nil
 }
 
-func (p *ServerPool) GetNextLeastConnections() *Server {
+// GetNextLeastConnections returns the alive backend with the fewest in-flight
+// requests, skipping any backend in tried (nil means "none tried"). Ties are
+// broken by reservoir sampling so each tied backend is equally likely -- a
+// clock-parity coin flip is not random, since UnixNano is always even on
+// platforms whose clock is coarser than a nanosecond.
+func (p *ServerPool) GetNextLeastConnections(tried map[*Server]bool) *Server {
 
 	var best *Server
-	minConns := int64(-1)
+	var minConns int64
+	ties := 0
 
 	for _, s := range p.servers {
 
-		if !s.IsAlive() {
+		if !s.IsAlive() || tried[s] {
 			continue
 		}
 
 		conns := s.ActiveConnections()
 
-		if minConns == -1 || conns < minConns {
+		if best == nil || conns < minConns {
 			best = s
 			minConns = conns
+			ties = 1
 			continue
 		}
 
 		if conns == minConns {
-			if time.Now().UnixNano()%2 == 0 {
+			ties++
+			if rand.IntN(ties) == 0 {
 				best = s
 			}
 		}
@@ -70,6 +80,10 @@ func (p *ServerPool) StartHealthChecks(
 	go func() {
 		defer ticker.Stop()
 
+		// Probe immediately: NewTicker does not fire until the first interval
+		// elapses, so without this every backend is assumed alive until then.
+		p.healthCheck()
+
 		for {
 			select {
 
@@ -86,7 +100,7 @@ func (p *ServerPool) StartHealthChecks(
 
 func checkServerHealth(server *Server, client *http.Client) {
 
-	healthURL := server.URL.String() + "/health"
+	healthURL := server.URL.JoinPath("/health").String()
 
 	resp, err := client.Get(healthURL)
 
@@ -96,7 +110,15 @@ func checkServerHealth(server *Server, client *http.Client) {
 		if resp.StatusCode == http.StatusOK {
 			alive = true
 		}
+		// Drain before closing so the connection can be pooled and reused.
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+	}
+
+	// A passively-ejected backend stays out until its cooldown expires, even
+	// if it keeps answering /health with 200 -- that is the whole point.
+	if alive && !server.CanReadmit() {
+		return
 	}
 
 	if alive != server.IsAlive() {

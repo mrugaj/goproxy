@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,7 +17,10 @@ import (
 
 func main() {
 
-	cfg, err := config.LoadConfig("config.yaml")
+	configPath := flag.String("config", "config.yaml", "path to the YAML config file")
+	flag.Parse()
+
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("failed to load config: %v", err)
 	}
@@ -40,10 +44,13 @@ func main() {
 	)
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           lb,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		Addr:        fmt.Sprintf(":%d", cfg.Port),
+		Handler:     lb,
+		ReadTimeout: 5 * time.Second,
+		// No WriteTimeout: it caps total response duration, which truncates
+		// streaming responses and large downloads. Upstream stalls are bounded
+		// by the transport's ResponseHeaderTimeout instead.
+		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 		ReadHeaderTimeout: 2 * time.Second,
 	}

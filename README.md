@@ -17,27 +17,50 @@ Built to explore distributed systems, reverse proxying, and cloud-native network
 # ✨ Features
 
 ## ⚖️ Least Connections Load Balancing
-Routes incoming requests to the backend with the fewest active connections, helping distribute traffic efficiently under load.
+Routes each request to the healthy backend with the fewest **in-flight requests**
+(not TCP connections — keep-alive means one connection carries many requests).
+Ties are broken by uniform reservoir sampling.
 
 ## 🏥 Active Health Checks
-Continuously monitors backend `/health` endpoints and automatically removes unhealthy servers from rotation until recovery.
+Probes every backend's `/health` endpoint in parallel on a configurable interval
+(first probe runs immediately at startup), removing non-200 backends from
+rotation until they recover.
 
 ## 🔄 Automatic Retry Mechanism
-Failed requests are transparently retried against healthy backends without dropping the client connection.
+Idempotent requests (`GET`, `HEAD`, `OPTIONS`) are retried on transport-level
+failure. Each attempt excludes the backends already tried, so a retry always
+moves to a different backend. Retries stop early if the client disconnects or
+if any part of the response has already reached the client.
+
+## 🚫 Passive Outlier Ejection
+Active probing is blind to a backend that answers `/health` with `200` while
+failing every real request. Five consecutive real-request failures eject a
+backend for 30s, and the cooldown outranks the health checker — otherwise a
+lying backend is readmitted on the very next tick and simply flaps.
+
+## 🪣 Retry Budget
+Retries may consume at most 20% of in-flight load (with a floor of 3, so
+low-traffic instances can still retry). Without a budget, a partial backend
+outage multiplies load on the survivors by `max_retries + 1` at exactly the
+moment they can least absorb it.
 
 ## ⚙️ YAML-Based Configuration
-All runtime behavior is configurable through a clean `config.yaml` file.
+All runtime behavior is configurable through a clean `config.yaml` file, passed
+with `-config`. The config is validated at startup — a bad port, non-positive
+health interval, negative retry count, empty backend list, or malformed backend
+URL fails fast with a clear message instead of at request time.
 
 ## 🛑 Graceful Shutdown
 Handles `SIGINT` and `SIGTERM` signals to ensure in-flight requests complete safely before shutdown.
 
 ## 🔒 Concurrency Safe
-Built using:
+Lock-free by design. Per-backend state uses:
 
-- `sync/atomic`
-- `sync.RWMutex`
+- `atomic.Int64` — in-flight request count
+- `atomic.Bool` — liveness flag
 
-to prevent race conditions during concurrent traffic handling.
+No mutex is needed: the backend set is immutable after startup, so concurrent
+readers are safe without synchronization. Verified under `go test -race`.
 
 ---
 
@@ -106,8 +129,8 @@ goproxy/
 ## 1️⃣ Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/go-load-balancer.git
-cd go-load-balancer
+git clone https://github.com/mrugaj/goproxy.git
+cd goproxy
 ```
 
 ---
@@ -122,21 +145,23 @@ go mod tidy
 
 ## 3️⃣ Start Backend Servers
 
-You can use the included backend servers (`be-1` and `be-2`) or any HTTP servers exposing a `/health` endpoint.
+Any HTTP servers exposing a `/health` endpoint that returns `200` will work.
+A minimal one:
 
-### Terminal 1
+```go
+package main
 
-```bash
-cd be-1
-go run main.go
+import ("fmt"; "net/http"; "os")
+
+func main() {
+	port := os.Args[1]
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintf(w, "backend-%s\n", port) })
+	http.ListenAndServe(":"+port, nil)
+}
 ```
 
-### Terminal 2
-
-```bash
-cd be-2
-go run main.go
-```
+Run two copies on `8080` and `8081`.
 
 ---
 
@@ -159,12 +184,24 @@ backends:
 ## 5️⃣ Run the Load Balancer
 
 ```bash
-go run cmd/loadbalancer/main.go
+go run ./cmd/loadbalancer -config config.yaml
 ```
+
+`-config` defaults to `config.yaml` in the working directory.
 
 ---
 
 # 🧪 Testing
+
+## Unit & Integration Tests
+
+```bash
+go test -race ./...
+```
+
+Covers selection fairness, retry backend-exclusion, retry-budget limits,
+passive ejection and its cooldown, connection-counter balance, the
+no-healthy-backends path, and config validation.
 
 ## Send Traffic
 
@@ -172,7 +209,7 @@ go run cmd/loadbalancer/main.go
 curl http://localhost:8000
 ```
 
-Requests should distribute dynamically based on active connection count.
+Requests should distribute dynamically based on in-flight request count.
 
 ---
 
@@ -214,6 +251,8 @@ The application will wait for in-flight requests to finish before shutting down 
 
 - Reverse Proxying
 - Layer 7 Load Balancing
+- Passive Outlier Ejection
+- Retry Budgets
 - Least Connections Scheduling
 - Distributed Systems Fundamentals
 - Fault Tolerance
@@ -222,6 +261,21 @@ The application will wait for in-flight requests to finish before shutting down 
 - Concurrency Safety
 - Graceful Shutdown Handling
 - Cloud-Native Inspired System Design
+
+---
+
+# ⚠️ Known Limitations
+
+Deliberate scope boundaries, not oversights:
+
+| Limitation | Impact |
+|---|---|
+| **No retry backoff or jitter** | Retries are immediate. The retry budget caps concurrency, but there is no delay between attempts. |
+| **Ejection thresholds are constants** | `passiveFailureThreshold`, `ejectionDuration`, and the retry budget ratio are compile-time constants, not config. |
+| **No health-check hysteresis** | A single failed probe ejects a backend; a single success readmits it. No flap damping. |
+| **Per-process connection counts** | Running multiple replicas degrades least-connections toward random, since each replica only sees its own traffic. P2C would be the fix. |
+| **No TLS, auth, or rate limiting** | The listener is plain HTTP and there is no concurrency cap. |
+| **No metrics or structured logging** | Observability is `log.Printf` to stderr. |
 
 ---
 
@@ -265,8 +319,7 @@ Extend support for modern Cloud-Native Inspired communication protocols.
 - `httputil.ReverseProxy`
 - YAML
 - Goroutines
-- Atomic Counters
-- Mutex Synchronization
+- Atomic Counters (lock-free)
 
 ---
 
